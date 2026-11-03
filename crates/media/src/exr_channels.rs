@@ -13,6 +13,10 @@ use std::sync::{Arc, Mutex, OnceLock};
 use effectcraft_raster::AuxChannels;
 use effectcraft_raster::channels3d::{BACKGROUND_DEPTH, split_channel};
 
+/// The largest display window decoded (16384²; vector footage and Continuously Rasterize
+/// stop at the same size).
+const MAX_DISPLAY_PIXELS: usize = 1 << 28;
+
 fn is_depth(name: &str) -> bool {
     let last = name.rsplit('.').next().unwrap_or(name);
     last.eq_ignore_ascii_case("z") || name.to_ascii_lowercase().contains("depth")
@@ -75,34 +79,23 @@ pub fn read_exr_channels(bytes: &[u8]) -> Option<AuxChannels> {
         }
     };
     collect_meta(&img.attributes.other);
-    for layer in img.layer_data.iter() {
+    // Each channel is a display-window plane: a 60000² window over a 1×1 data window was a
+    // multi-gigabyte allocation per channel (#2141).
+    let n = w.checked_mul(h).filter(|n| *n <= MAX_DISPLAY_PIXELS)?;
+    // The decoded image is consumed channel by channel, so each channel's samples are freed (or
+    // moved) as its plane is made instead of the whole file being held twice (#474).
+    for layer in img.layer_data {
         collect_meta(&layer.attributes.other);
         let prefix = layer.attributes.layer_name.as_ref().map(|t| t.to_string()).filter(|s| !s.is_empty());
-        let (lw, lh) = (layer.size.0, layer.size.1);
+        let size = (layer.size.0, layer.size.1);
         let pos = layer.attributes.layer_position;
-        let (ox, oy) = (pos.0 as i64 - dw.position.0 as i64, pos.1 as i64 - dw.position.1 as i64);
-        for ch in layer.channel_data.list.iter() {
+        let offset = (i64::from(pos.0) - i64::from(dw.position.0), i64::from(pos.1) - i64::from(dw.position.1));
+        for ch in layer.channel_data.list {
             let name = channel_name(prefix.as_deref(), &ch.name.to_string());
             let fill = if is_depth(&name) { BACKGROUND_DEPTH } else { 0.0 };
-            let mut plane = vec![fill; w * h];
-            let vals: Vec<f32> = ch.sample_data.values_as_f32().collect();
-            if vals.len() < lw * lh {
-                continue;
+            if let Some(plane) = place(ch.sample_data, size, offset, (w, h), n, fill) {
+                aux.channels.push((name, plane));
             }
-            for y in 0..lh {
-                let ty = y as i64 + oy;
-                if ty < 0 || ty >= h as i64 {
-                    continue;
-                }
-                for x in 0..lw {
-                    let tx = x as i64 + ox;
-                    if tx < 0 || tx >= w as i64 {
-                        continue;
-                    }
-                    plane[ty as usize * w + tx as usize] = vals[y * lw + x];
-                }
-            }
-            aux.channels.push((name, plane));
         }
     }
     for (_, (name, manifest)) in crypto {
@@ -112,6 +105,45 @@ pub fn read_exr_channels(bytes: &[u8]) -> Option<AuxChannels> {
     }
     aux.manifests.sort();
     Some(aux)
+}
+
+/// One channel's samples (`size`, at `offset` in the `display` window of `n` pixels) as a
+/// display-window plane, `fill` outside its data window. A channel covering exactly the display
+/// window is converted in one pass, and an f32 one is moved without a copy. `None` when the
+/// channel has fewer samples than its size.
+fn place(samples: exr::image::FlatSamples, size: (usize, usize), offset: (i64, i64), display: (usize, usize), n: usize, fill: f32) -> Option<Vec<f32>> {
+    use exr::image::FlatSamples;
+    let (lw, lh) = size;
+    if samples.len() < lw.checked_mul(lh)? {
+        return None;
+    }
+    if size == display && offset == (0, 0) {
+        return Some(match samples {
+            FlatSamples::F32(mut v) => {
+                v.truncate(n);
+                v
+            }
+            FlatSamples::F16(v) => v.iter().take(n).map(|s| s.to_f32()).collect(),
+            FlatSamples::U32(v) => v.iter().take(n).map(|s| *s as f32).collect(),
+        });
+    }
+    let value = |i: usize| match &samples {
+        FlatSamples::F32(v) => v.get(i).copied(),
+        FlatSamples::F16(v) => v.get(i).map(|s| s.to_f32()),
+        FlatSamples::U32(v) => v.get(i).map(|s| *s as f32),
+    };
+    let (w, h) = display;
+    let mut plane = vec![fill; n];
+    for y in 0..lh {
+        let Some(ty) = usize::try_from(y as i64 + offset.1).ok().filter(|ty| *ty < h) else { continue };
+        for x in 0..lw {
+            let Some(tx) = usize::try_from(x as i64 + offset.0).ok().filter(|tx| *tx < w) else { continue };
+            if let (Some(v), Some(p)) = (value(y * lw + x), plane.get_mut(ty * w + tx)) {
+                *p = v;
+            }
+        }
+    }
+    Some(plane)
 }
 
 /// Names of the beauty pass, most preferred first, matched against the last part of a layer's
@@ -157,7 +189,7 @@ fn picture_layer<'a>(aux: &AuxChannels, layers: &[&'a str]) -> Option<&'a str> {
 /// The picture of a multi-layer OpenEXR file without an unnamed RGB layer (Blender's
 /// `ViewLayer.Combined.R`, the compositor's `Image.R`, Nuke's `beauty.R`, …), which the image
 /// decoder rejects. After Effects shows a file's main RGBA channels and leaves the other layers
-/// to EXtractoR; here that is the beauty pass by name ([`BEAUTY`]), else the first colour layer
+/// to EXtractoR; here that is the beauty pass by name (`BEAUTY`), else the first colour layer
 /// that is not a data pass (never Cryptomatte, depth or normals, #412), else the first channel
 /// as grey. Linear, straight RGBA as the file stores it. `None` when it is not a readable EXR.
 pub fn layered_image(bytes: &[u8]) -> Option<image::DynamicImage> {
@@ -262,6 +294,31 @@ mod tests {
         assert!(read_exr_channels(b"not an exr").is_none());
     }
 
+    /// #474: a full-window f32 channel (Cryptomatte ranks, …) becomes its plane without a copy,
+    /// so a decode no longer holds the file's samples twice; other channels are placed in the
+    /// display window as before.
+    #[test]
+    fn channels_become_planes_without_an_extra_copy() {
+        use exr::image::FlatSamples;
+        let v = vec![0.25f32; 6];
+        let ptr = v.as_ptr();
+        let plane = place(FlatSamples::F32(v), (3, 2), (0, 0), (3, 2), 6, 0.0).unwrap();
+        assert_eq!(plane.as_ptr(), ptr, "moved, not copied");
+        assert_eq!(plane, [0.25; 6]);
+        let half = |x: f32| exr::prelude::f16::from_f32(x);
+        let full = place(FlatSamples::F16(vec![half(0.5); 6]), (3, 2), (0, 0), (3, 2), 6, 0.0).unwrap();
+        assert_eq!(full, [0.5; 6]);
+        // A 2×1 data window at (1, 1) of a 3×2 display window; the rest is the fill.
+        let part = place(FlatSamples::F16(vec![half(1.0), half(2.0)]), (2, 1), (1, 1), (3, 2), 6, 9.0).unwrap();
+        assert_eq!(part, [9.0, 9.0, 9.0, 9.0, 1.0, 2.0]);
+        // Partly outside the display window: clipped, never out of bounds.
+        let off = place(FlatSamples::U32(vec![7, 8]), (2, 1), (2, -1), (3, 2), 6, 0.0).unwrap();
+        assert_eq!(off, [0.0; 6]);
+        let edge = place(FlatSamples::U32(vec![7, 8]), (2, 1), (2, 0), (3, 2), 6, 0.0).unwrap();
+        assert_eq!(edge, [0.0, 0.0, 7.0, 0.0, 0.0, 0.0]);
+        assert!(place(FlatSamples::F32(vec![1.0; 5]), (3, 2), (0, 0), (3, 2), 6, 0.0).is_none(), "too few samples");
+    }
+
     /// #295: a multi-layer EXR whose colour is only in named layers (`diffuse.R`, as Blender and
     /// Nuke write them) failed to import ("does not contain non-deep rgb channels"); it now
     /// shows its colour layer and keeps every channel for EXtractoR.
@@ -284,6 +341,18 @@ mod tests {
         pool.frame_at(&f, effectcraft_time::Tick::ZERO).unwrap();
         let aux = cached(path, || panic!("the frame's decode is reused, the file is not read again")).unwrap();
         assert_eq!(aux.get("GlossDir.R").and_then(|p| p.first()).copied(), Some(0.25));
+    }
+
+    /// #2141: one pixel of data in a 60000² display window is refused, not allocated per channel.
+    #[test]
+    fn a_huge_display_window_is_refused_not_allocated() {
+        use exr::prelude::*;
+        let channels = AnyChannels::sort(vec![AnyChannel::new("R", FlatSamples::F32(vec![0.5]))].into());
+        let mut image = Image::from_layer(Layer::new((1, 1), LayerAttributes::default(), Encoding::FAST_LOSSLESS, channels));
+        image.attributes.display_window = IntegerBounds::new((0, 0), (60000, 60000));
+        let mut bytes = std::io::Cursor::new(Vec::new());
+        image.write().to_buffered(&mut bytes).unwrap();
+        assert!(read_exr_channels(&bytes.into_inner()).is_none());
     }
 
     #[test]
